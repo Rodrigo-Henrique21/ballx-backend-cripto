@@ -64,6 +64,18 @@ def get_secret_reader():
             return cache[name]
 
         val: Optional[str] = None
+
+    use_kv = os.getenv("BALLX_DISABLE_KV") not in ("1","true","True")
+    # usa kv-ballx-backend por padrão se VAULT_URL não estiver definido
+    vault_url = os.getenv("VAULT_URL", "https://kv-ballx-backend.vault.azure.net/")
+    client = None
+    if use_kv:
+        cred = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+        client = SecretClient(vault_url=vault_url, credential=cred)
+    cache = {}
+    def _get(name: str, required=True) -> Optional[str]:
+        if name in cache: return cache[name]
+        val = None
         if client:
             try:
                 val = client.get_secret(name).value

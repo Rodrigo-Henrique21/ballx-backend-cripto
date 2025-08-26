@@ -31,8 +31,6 @@ Para testes locais é possível usar apenas variáveis de ambiente definidas em 
 2. Defina `BALLX_USE_KV=0` para evitar o acesso ao Key Vault.
 3. Execute o script ou o servidor normalmente; os valores serão carregados do `.env`.
 
----
-
 ## 3) Deploy em contêiner (ACR + ACI)
 
 1. **Build** da imagem local:
