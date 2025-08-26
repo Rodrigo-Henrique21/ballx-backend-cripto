@@ -4,6 +4,7 @@ from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
 from typing import Optional
 
+from dotenv import load_dotenv
 from web3 import Web3, Account
 from web3.exceptions import ContractLogicError, TimeExhausted
 from web3.types import TxParams
@@ -11,10 +12,12 @@ from web3.types import TxParams
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
 
+load_dotenv()
+
 CHAIN_ID = 137  # Polygon
 APP_NAME = "BALLX-Distributor"
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(APP_NAME)
 
@@ -36,20 +39,31 @@ AUTHORITY_ABI = [
      "name":"distribute","outputs":[],"stateMutability":"nonpayable","type":"function"}
 ]
 
-# ---------- Key Vault ----------
+# ---------- Key Vault / ENV ----------
 def get_secret_reader():
-    use_kv = os.getenv("BALLX_DISABLE_KV") not in ("1","true","True")
-    vault_url = os.getenv("VAULT_URL")
+    """Retorna função que busca segredos do Key Vault ou ENV.
+
+    Usa o Key Vault somente se ``BALLX_USE_KV`` não estiver definido para falso.
+    Sempre faz fallback para variáveis de ambiente caso não consiga ler do KV.
+    """
+
+    use_kv = os.getenv("BALLX_USE_KV", "1").lower() not in ("0", "false", "no")
+    vault_url = os.getenv("VAULT_URL", "https://kv-ballx-backend.vault.azure.net/")
     client = None
     if use_kv:
-        if not vault_url:
-            raise RuntimeError("Defina VAULT_URL para usar Key Vault.")
-        cred = DefaultAzureCredential(exclude_interactive_browser_credential=True)
-        client = SecretClient(vault_url=vault_url, credential=cred)
-    cache = {}
-    def _get(name: str, required=True) -> Optional[str]:
-        if name in cache: return cache[name]
-        val = None
+        try:
+            cred = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+            client = SecretClient(vault_url=vault_url, credential=cred)
+        except Exception as e:
+            log.warning(f"KV: cliente não inicializado: {e}")
+
+    cache: dict[str, Optional[str]] = {}
+
+    def _get(name: str, required: bool = True) -> Optional[str]:
+        if name in cache:
+            return cache[name]
+
+        val: Optional[str] = None
         if client:
             try:
                 val = client.get_secret(name).value
@@ -57,10 +71,13 @@ def get_secret_reader():
                 log.warning(f"KV: segredo {name} não lido do KV: {e}")
         if val is None:
             val = os.getenv(name)
+
         if required and (not val or not str(val).strip()):
             raise RuntimeError(f"Segredo {name} não encontrado (KV/ENV).")
+
         cache[name] = val
         return val
+
     return _get
 
 # ---------- Utils ----------
@@ -131,7 +148,18 @@ def mark_processed(key:str, tx_hash:str):
         log.warning(f"Falha ao persistir idempotência: {e}")
 
 # ---------- Core ----------
-def run(args):
+def send_ballx(
+    to: str,
+    amount,
+    *,
+    tipo: str = "INV",
+    reason: Optional[str] = None,
+    human_refid: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    wait: bool = False,
+    wait_timeout: int = 180,
+    priority_gwei: int = 40,
+):
     get = get_secret_reader()
     RPC_URL           = get("BALLX_RPC_URL")
     OPERATOR_PK       = get("BALLX_OPERATOR_PK")
@@ -145,13 +173,13 @@ def run(args):
 
     operator = Account.from_key(OPERATOR_PK if OPERATOR_PK.startswith("0x") else "0x"+OPERATOR_PK)
     operator_addr = to_checksum(operator.address)
-    to_addr = to_checksum(args.to)
+    to_addr = to_checksum(to)
 
     token     = w3.eth.contract(address=to_checksum(TOKEN_ADDRESS), abi=ERC20_ABI)
     authority = w3.eth.contract(address=to_checksum(AUTHORITY_ADDRESS), abi=AUTHORITY_ABI)
 
     decimals = token.functions.decimals().call()
-    amount18 = human_to_amount18(args.amount, decimals)
+    amount18 = human_to_amount18(amount, decimals)
 
     reserve_bal = token.functions.balanceOf(to_checksum(RESERVE_ADDRESS)).call()
     allowance   = token.functions.allowance(to_checksum(RESERVE_ADDRESS), to_checksum(AUTHORITY_ADDRESS)).call()
@@ -161,27 +189,26 @@ def run(args):
         raise RuntimeError("Allowance Reserva→Authority insuficiente (faça approve).")
 
     now = now_utc()
-    if args.human_refid:
-        human_ref = args.human_refid.strip()
+    if human_refid:
+        human_ref = human_refid.strip()
     else:
         # refId = TIPO-YYYYMMDDTHHMMSS-last6-XXXX
         nonce4 = f"{int(time.time()*1_000_000)%10000:04d}"
-        human_ref = make_human_refid(args.tipo, to_addr, now, nonce4)
+        human_ref = make_human_refid(tipo, to_addr, now, nonce4)
     if len(human_ref.encode("utf-8")) > 32:
         raise ValueError("human_refid > 32 bytes. Encurte TIPO/format.")
     ref_b32 = to_bytes32_ascii(human_ref)
-    reason  = args.reason or f"{args.tipo} - BALLX"
+    reason  = reason or f"{tipo} - BALLX"
 
     # Idempotência
-    if args.idempotency_key:
-        prev = was_processed(args.idempotency_key)
+    if idempotency_key:
+        prev = was_processed(idempotency_key)
         if prev:
             log.info(f"idempotency-key já processada. tx={prev}")
-            print(json.dumps({"idempotency_key":args.idempotency_key,"tx_hash":prev}, indent=2))
-            return
+            return {"idempotency_key": idempotency_key, "tx_hash": prev}
 
     # Taxas
-    max_fee, prio, gp = suggest_fees(w3, args.priority_gwei)
+    max_fee, prio, gp = suggest_fees(w3, priority_gwei)
     tx_base = {
         "from": operator_addr,
         "nonce": w3.eth.get_transaction_count(operator_addr),
@@ -202,26 +229,44 @@ def run(args):
             signed = w3.eth.account.sign_transaction(tx, OPERATOR_PK if OPERATOR_PK.startswith("0x") else "0x"+OPERATOR_PK)
             tx_hash = w3.eth.send_raw_transaction(signed.rawTransaction).hex()
             log.info(f"tx enviada: {tx_hash} {polygonscan_tx_url(tx_hash)}")
-            if args.idempotency_key:
-                mark_processed(args.idempotency_key, tx_hash)
+            if idempotency_key:
+                mark_processed(idempotency_key, tx_hash)
             result = {
-                "app":APP_NAME,"to":to_addr,"amount18":str(amount18),"decimals":decimals,
-                "human_refid":human_ref,"refid_bytes32":ref_b32,"reason":reason,
-                "tx_hash":tx_hash,"explorer":polygonscan_tx_url(tx_hash),
-                "timestamp":now.isoformat()
+                "app": APP_NAME,
+                "to": to_addr,
+                "amount18": str(amount18),
+                "decimals": decimals,
+                "human_refid": human_ref,
+                "refid_bytes32": ref_b32,
+                "reason": reason,
+                "tx_hash": tx_hash,
+                "explorer": polygonscan_tx_url(tx_hash),
+                "timestamp": now.isoformat(),
             }
-            print(json.dumps(result, ensure_ascii=False, indent=2))
-            if args.wait:
-                rc = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=args.wait_timeout)
-                print(json.dumps({"confirmed": rc.status==1, "blockNumber": rc.blockNumber}, indent=2))
-            return
-        except (ContractLogicError, TimeExhausted) as e:
+            if wait:
+                rc = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=wait_timeout)
+                result["confirmation"] = {"confirmed": rc.status == 1, "blockNumber": rc.blockNumber}
+            return result
+        except (ContractLogicError, TimeExhausted):
             raise
         except Exception as e:
             last_err = e
             log.warning(f"tentativa {i+1}/5 falhou: {e}")
             backoff_sleep(i)
     raise RuntimeError(f"Falha ao enviar transação após retries: {last_err}")
+
+def run(args):
+    return send_ballx(
+        args.to,
+        args.amount,
+        tipo=args.tipo,
+        reason=args.reason,
+        human_refid=args.human_refid,
+        idempotency_key=args.idempotency_key,
+        wait=args.wait,
+        wait_timeout=args.wait_timeout,
+        priority_gwei=args.priority_gwei,
+    )
 
 def parse_args():
     p = argparse.ArgumentParser(description="BALLX • Distribute via Authority (Key Vault + Prod)")
@@ -238,4 +283,5 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    run(args)
+    result = run(args)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
