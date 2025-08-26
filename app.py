@@ -1,9 +1,13 @@
 import json
 import hmac
 import hashlib
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
 from web3 import Web3
 from send_ballx_prod import send_ballx, get_secret_reader
+
+
+load_dotenv()
 
 app = FastAPI()
 

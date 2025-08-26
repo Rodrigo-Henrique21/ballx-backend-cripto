@@ -4,6 +4,7 @@ from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
 from typing import Optional
 
+from dotenv import load_dotenv
 from web3 import Web3, Account
 from web3.exceptions import ContractLogicError, TimeExhausted
 from web3.types import TxParams
@@ -11,10 +12,12 @@ from web3.types import TxParams
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
 
+load_dotenv()
+
 CHAIN_ID = 137  # Polygon
 APP_NAME = "BALLX-Distributor"
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL","INFO"),
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(APP_NAME)
 
@@ -36,8 +39,32 @@ AUTHORITY_ABI = [
      "name":"distribute","outputs":[],"stateMutability":"nonpayable","type":"function"}
 ]
 
-# ---------- Key Vault ----------
+# ---------- Key Vault / ENV ----------
 def get_secret_reader():
+    """Retorna função que busca segredos do Key Vault ou ENV.
+
+    Usa o Key Vault somente se ``BALLX_USE_KV`` não estiver definido para falso.
+    Sempre faz fallback para variáveis de ambiente caso não consiga ler do KV.
+    """
+
+    use_kv = os.getenv("BALLX_USE_KV", "1").lower() not in ("0", "false", "no")
+    vault_url = os.getenv("VAULT_URL", "https://kv-ballx-backend.vault.azure.net/")
+    client = None
+    if use_kv:
+        try:
+            cred = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+            client = SecretClient(vault_url=vault_url, credential=cred)
+        except Exception as e:
+            log.warning(f"KV: cliente não inicializado: {e}")
+
+    cache: dict[str, Optional[str]] = {}
+
+    def _get(name: str, required: bool = True) -> Optional[str]:
+        if name in cache:
+            return cache[name]
+
+        val: Optional[str] = None
+
     use_kv = os.getenv("BALLX_DISABLE_KV") not in ("1","true","True")
     # usa kv-ballx-backend por padrão se VAULT_URL não estiver definido
     vault_url = os.getenv("VAULT_URL", "https://kv-ballx-backend.vault.azure.net/")
@@ -56,10 +83,13 @@ def get_secret_reader():
                 log.warning(f"KV: segredo {name} não lido do KV: {e}")
         if val is None:
             val = os.getenv(name)
+
         if required and (not val or not str(val).strip()):
             raise RuntimeError(f"Segredo {name} não encontrado (KV/ENV).")
+
         cache[name] = val
         return val
+
     return _get
 
 # ---------- Utils ----------

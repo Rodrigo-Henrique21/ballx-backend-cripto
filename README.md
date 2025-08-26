@@ -23,7 +23,13 @@ source .venv/bin/activate   # Windows: .venv\\Scripts\\activate
 pip install -r requirements.txt
 ```
 
----
+### Execução local sem Key Vault
+
+Para testes locais é possível usar apenas variáveis de ambiente definidas em um arquivo `.env`.
+
+1. Copie `.env.example` para `.env` e preencha os valores.
+2. Defina `BALLX_USE_KV=0` para evitar o acesso ao Key Vault.
+3. Execute o script ou o servidor normalmente; os valores serão carregados do `.env`.
 
 ## 3) Deploy em contêiner (ACR + ACI)
 
