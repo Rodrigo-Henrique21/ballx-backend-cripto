@@ -1,0 +1,6 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+web3==6.20.1
+eth-account==0.11.2
+azure-identity==1.17.1
+azure-keyvault-secrets==4.8.0
