@@ -1,88 +1,136 @@
-## 1) Visão geral
+# BALLX Backend Distributor
 
-- **De onde sai**: a Reserva (Oriah) **não assina** — ela apenas faz `approve(Authority, limite)` do token BALLX.
-- **Quem envia**: o **operador** do Authority assina a transação `distribute(...)`.
-- **O que vai on-chain**: `to`, `amount(18d)`, `refId(bytes32)`, `reason(string)`.
-- **De onde vêm os segredos**: `DefaultAzureCredential` → Managed Identity (nuvem) ou Azure CLI / Service Principal (local).
-- **Pontos de robustez**: EIP-1559 com fallback, checagem de saldo da Reserva/allowance, verificação de MATIC para gas, idempotência opcional.
+## Visão Geral
 
----
+O BALLX Backend Distributor é um serviço robusto e seguro desenvolvido em Python para gerenciar a distribuição automatizada de tokens BALLX na rede Polygon. Este serviço atua como uma ponte entre sistemas Web2 e Web3, permitindo a distribuição programática de tokens através de um endpoint webhook HTTP seguro.
 
-## 2) Pré-requisitos
+### Principais Características
 
-- Python 3.10+ (recomendado 3.11+)
-- Azure Key Vault criado
-- Identidade com permissão **Key Vault Secrets User** no Key Vault:
-  - **Produção (Azure Functions/VM/App Service)** → **Managed Identity** do recurso
-  - **Local** → Azure CLI logado **OU** Service Principal (ENV)
+- **Arquitetura Segura**: Integração com Azure Key Vault para gerenciamento seguro de chaves e secrets
+- **Webhook HTTP**: Endpoint RESTful para integração com sistemas externos
+- **Validação Criptográfica**: Assinatura HMAC SHA256 para garantir a autenticidade das requisições
+- **Smart Contract Integration**: Interação direta com contratos ERC20 e Authority na Polygon
+- **Containerização**: Suporte completo a Docker para fácil deploy e escalabilidade
+- **Monitoramento**: Logging detalhado para rastreamento de operações
+- **Resiliência**: Implementação de EIP-1559 com fallback para transações blockchain
 
-Instale as dependências:
-```bash
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\\Scripts\\activate
-pip install -r requirements.txt
-```
+## Arquitetura
 
-### Execução local sem Key Vault
+### Fluxo de Distribuição
+1. Sistema externo (ex: WordPress) envia requisição webhook
+2. Backend valida a assinatura HMAC do payload
+3. Serviço interage com Smart Contracts na Polygon:
+   - Verifica saldo e allowance do token BALLX
+   - Executa distribuição através do contrato Authority
+   - Monitora status da transação
 
-Para testes locais é possível usar apenas variáveis de ambiente definidas em um arquivo `.env`.
+### Componentes
+- **FastAPI**: Framework web de alta performance
+- **Web3.py**: Interface com blockchain
+- **Azure Identity**: Gerenciamento de credenciais
+- **Azure Key Vault**: Armazenamento seguro de secrets
 
-1. Copie `.env.example` para `.env` e preencha os valores.
-2. Defina `BALLX_USE_KV=0` para evitar o acesso ao Key Vault.
-3. Execute o script ou o servidor normalmente; os valores serão carregados do `.env`.
+## Pré-requisitos
 
-## 3) Deploy em contêiner (ACR + ACI)
+- Python 3.11+ 
+- Azure Key Vault configurado
+- Acesso à rede Polygon
+- Docker (opcional)
 
-1. **Build** da imagem local:
+### Configuração de Ambiente
+
+1. **Instalação Local**:
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate   # Windows: .venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
+
+2. **Variáveis de Ambiente**:
+   - Copie `.env.example` para `.env`
+   - Configure as variáveis necessárias
+   - Para desenvolvimento local, defina `BALLX_USE_KV=0`
+
+### Permissões Azure
+
+- **Produção**: Managed Identity com role "Key Vault Secrets User"
+- **Desenvolvimento**: Azure CLI ou Service Principal
+
+## Deploy
+
+### Container (Azure Container Instances)
+
+1. **Build da Imagem**:
    ```bash
    docker build -t ballx:latest .
    ```
-2. **Login** e push no Azure Container Registry (ACR):
+
+2. **Push para Azure Container Registry**:
    ```bash
    az acr login -n <registry>
    docker tag ballx:latest <registry>.azurecr.io/ballx:latest
    docker push <registry>.azurecr.io/ballx:latest
    ```
-3. **Executar** no Azure Container Instances (ACI) usando o Key Vault `kv-ballx-backend`:
+
+3. **Deploy em ACI**:
    ```bash
    az container create \
      -g <resource-group> \
      -n ballx-distributor \
      --image <registry>.azurecr.io/ballx:latest \
      --assign-identity \
-     --environment-variables VAULT_URL=https://kv-ballx-backend.vault.azure.net/ \
-     --secure-environment-variables \
-       BALLX_RPC_URL=<rpc> \
-       BALLX_OPERATOR_PK=<pk> \
-       BALLX_AUTHORITY_ADDRESS=<addr> \
-       BALLX_TOKEN_ADDRESS=<addr> \
-       BALLX_RESERVE_ADDRESS=<addr>
+     --environment-variables KEYVAULT_URI=https://kv-ballx-backend.vault.azure.net/
    ```
 
-   A identidade gerenciada atribuída deve ter permissão **Key Vault Secrets User** no cofre `kv-ballx-backend`.
+## API Webhook
 
-Um exemplo de variáveis de ambiente necessárias está em `.env.example`.
+### Endpoint: `POST /webhook`
 
----
+**Headers**:
+- `X-WP-Signature`: HMAC SHA256 do payload usando `WEBHOOK_SECRET`
 
-## 4) Receptor de Webhook HTTP
-
-O contêiner expõe um serviço FastAPI na porta **8000** com endpoint `POST /webhook`.
-
-- O WordPress deve enviar um JSON com `wallet` (ou `wallet_address`), `amount`,
-  `tipo` opcional, `reason` opcional e `order_id`.
-- A requisição deve conter o cabeçalho `X-WP-Signature` com o **HMAC SHA256** do corpo usando `WEBHOOK_SECRET`.
-- Variáveis de ambiente:
-  - `WEBHOOK_SECRET` – segredo compartilhado para validar o webhook.
-  - Demais variáveis de blockchain (`BALLX_RPC_URL`, `BALLX_OPERATOR_PK`, etc.).
-
-Exemplo de execução local:
-```bash
-uvicorn app:app --reload
-# então teste:
-curl -X POST http://localhost:8000/webhook \
-  -H "X-WP-Signature: $(printf 'payload' | openssl dgst -sha256 -hmac $WEBHOOK_SECRET -hex | sed 's/^.* //')" \
-  -d '{"wallet":"0x...","amount":10}'
+**Payload**:
+```json
+{
+  "wallet": "0x...",
+  "amount": 10.5,
+  "order_id": "ORD123",
+  "reason": "Reward",
+  "tipo": "bonus"
+}
 ```
 
-O container em Azure Container Instances deve ter a porta 8000 exposta e receber o `WEBHOOK_SECRET` via Key Vault.
+### Segurança
+- Validação HMAC SHA256 obrigatória
+- Rate limiting
+- Validação de endereços Ethereum
+- Verificação de saldo
+
+### Exemplo de Teste Local:
+```bash
+uvicorn app:app --reload --port 8000
+```
+
+## Monitoramento e Manutenção
+
+- Logs estruturados com níveis INFO/ERROR
+- Métricas de gas e transações
+- Alertas de saldo baixo
+- Monitoramento de falhas de transação
+
+## Variáveis de Configuração
+
+### Blockchain
+- `RPC_URL`: URL do node Polygon
+- `OPERATOR_PK`: Chave privada do operador
+- `AUTHORITY_ADDRESS`: Endereço do contrato Authority
+- `TOKEN_ADDRESS`: Endereço do contrato BALLX
+
+### Segurança
+- `WEBHOOK_SECRET`: Secret para validação HMAC
+- `KEYVAULT_URI`: URI do Azure Key Vault
+
+### Performance
+- `GAS_LIMIT`: Limite de gas (default: 300000)
+- `MAX_FEE_GWEI`: Fee máximo (default: 60)
+- `MAX_PRIORITY_FEE_GWEI`: Priority fee máximo (default: 40)
